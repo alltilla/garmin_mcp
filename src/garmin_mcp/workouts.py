@@ -742,11 +742,13 @@ def register_tools(app):
         The default curated view renames fields and drops the ones only Garmin
         needs (stepId, ownerId, the numeric *TypeId codes, the weightUnit
         object). It is for reading. Writing the workout back needs raw=True:
-        a payload rebuilt from the curated view uploads as an empty workout.
+        a payload rebuilt from the curated view uploads as an empty workout,
+        and update_workout rejects it rather than let that happen.
 
         Args:
             workout_id: Workout ID (numeric) or UUID (for training plan workouts)
             raw: Return Garmin's unmodified DTO instead of the curated view.
+                Use for the read half of a read-modify-write via update_workout.
         """
         try:
             workout_id_str = str(workout_id)
@@ -1000,6 +1002,87 @@ def register_tools(app):
             "failed": total - succeeded,
             "results": results
         }, indent=2)
+
+    @app.tool()
+    async def update_workout(workout_id: int, workout_data: dict) -> str:
+        """Edit an existing workout in place, keeping its ID
+
+        Read-modify-write: call get_workout_by_id(workout_id, raw=True), change
+        the fields you want, and pass the whole DTO back here. The workout keeps
+        its ID, so anything referencing it (schedules, training plans) survives
+        the edit. Uploading a replacement and deleting the original does not.
+
+        Send the complete workout, not a patch — this is a PUT, so omitted
+        fields are dropped rather than left alone.
+
+        Garmin reassigns every "stepId" on each update, whether the payload
+        carries the old ones, omits them or sends nonsense. Step IDs are
+        therefore not durable references — re-read the workout after an update
+        instead of reusing IDs from before it. Only the workout ID survives.
+
+        workout_data must be Garmin's DTO shape (the raw=True view), not the
+        curated one: "workoutSegments" holding steps with "stepType",
+        "endCondition" and the numeric *TypeId codes. The curated view is
+        rejected — its renamed fields would upload as an empty workout.
+
+        The DTO rules that apply to upload_workout apply here unchanged; see
+        that tool's documentation for step types, target types, end conditions
+        and strength-training fields.
+
+        Args:
+            workout_id: ID of the workout to overwrite
+            workout_data: Complete workout DTO, as returned by
+                get_workout_by_id(workout_id, raw=True)
+        """
+        try:
+            if not isinstance(workout_data, dict):
+                return "Error updating workout: workout_data must be a workout DTO object."
+
+            if 'workoutSegments' not in workout_data:
+                hint = ""
+                if 'segments' in workout_data:
+                    hint = (
+                        " This looks like the curated view; re-read it with "
+                        "get_workout_by_id(workout_id, raw=True)."
+                    )
+                return (
+                    "Error updating workout: workout_data has no 'workoutSegments'."
+                    + hint
+                )
+
+            body_id = workout_data.get('workoutId')
+            if body_id is not None and int(body_id) != int(workout_id):
+                return (
+                    f"Error updating workout: workout_data is workout {body_id}, "
+                    f"but workout_id is {workout_id}."
+                )
+            workout_data['workoutId'] = int(workout_id)
+
+            # Garmin rejects an ownerless workout; recover it from the stored
+            # copy when the caller edited a payload that never carried one.
+            if workout_data.get('ownerId') is None:
+                existing = garmin_client.get_workout_by_id(int(workout_id))
+                if existing and existing.get('ownerId') is not None:
+                    workout_data['ownerId'] = existing['ownerId']
+
+            _normalize_workout_steps(workout_data)
+            _validate_end_condition_steps(workout_data)
+            _validate_target_type_steps(workout_data)
+
+            url = f"{garmin_client.garmin_workouts}/workout/{int(workout_id)}"
+            garmin_client.client.put("connectapi", url, json=workout_data, api=True)
+
+            curated = {
+                "status": "success",
+                "workout_id": int(workout_id),
+                "name": workout_data.get('workoutName'),
+                "message": "Workout updated successfully"
+            }
+            return json.dumps(
+                {k: v for k, v in curated.items() if v is not None}, indent=2
+            )
+        except Exception as e:
+            return f"Error updating workout: {str(e)}"
 
     @app.tool()
     async def delete_workout(workout_id: int) -> str:
