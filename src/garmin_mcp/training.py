@@ -26,6 +26,64 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# Performance Management Chart constants. CTL/ATL are exponentially weighted
+# moving averages of daily load with these time constants, so a day's load
+# keeps influencing CTL far longer than ATL -- that spread is what makes TSB
+# meaningful.
+_CTL_TAU_DAYS = 42
+_ATL_TAU_DAYS = 7
+# CTL needs several time constants of history before it settles. Days closer
+# than one time constant to the start of history are reported as ramp-in.
+_PMC_RAMP_IN_DAYS = _CTL_TAU_DAYS
+# Warm-up fetched before the requested window so CTL does not restart at zero
+# on the first requested day. ~4 time constants leaves <2% of the seed error.
+_PMC_WARMUP_DAYS = 4 * _CTL_TAU_DAYS
+
+
+def _ewma_next(previous: float, load: float, tau_days: int) -> float:
+    """Advance an exponentially weighted moving average by one day."""
+    alpha = 1.0 - math.exp(-1.0 / tau_days)
+    return previous + alpha * (load - previous)
+
+
+def _daily_training_loads(
+    start: datetime.date, end: datetime.date
+) -> Tuple[Dict[datetime.date, float], Optional[datetime.date], int]:
+    """Sum per-activity training load onto the local calendar day it started.
+
+    Returns the loads by date, the earliest activity date seen (the start of
+    available history), and the activity count. Activities are dated by
+    startTimeLocal because a training log day is the athlete's day, not UTC.
+    """
+    activities = garmin_client.get_activities_by_date(
+        start.isoformat(), end.isoformat()
+    )
+    loads: Dict[datetime.date, float] = {}
+    earliest: Optional[datetime.date] = None
+    counted = 0
+
+    for activity in activities or []:
+        started = activity.get("startTimeLocal") or activity.get("startTimeGMT")
+        if not started:
+            continue
+        try:
+            day = datetime.date.fromisoformat(str(started)[:10])
+        except ValueError:
+            continue
+
+        counted += 1
+        if earliest is None or day < earliest:
+            earliest = day
+
+        # An activity Garmin has not scored contributes nothing rather than
+        # dropping the day, so its date still counts towards available history.
+        load = activity.get("activityTrainingLoad")
+        if isinstance(load, (int, float)):
+            loads[day] = loads.get(day, 0.0) + float(load)
+
+    return loads, earliest, counted
+
+
 def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
     """Find all VO2 max values by sport in known Garmin response shapes."""
     if isinstance(data, list):
@@ -791,10 +849,29 @@ def register_tools(app):
     async def get_training_load_trend(start_date: str, end_date: str) -> str:
         """Get the Performance Management Chart (CTL/ATL/TSB) over a date range.
 
-        Returns Chronic Training Load (CTL, 42-day fitness), Acute Training Load (ATL, 7-day fatigue),
-        Training Stress Balance (TSB = CTL - ATL, form/freshness), and Acute:Chronic Workload Ratio
-        (ACWR) per day. Use this to assess whether the athlete is building fitness, peaking, or
-        accumulating too much fatigue.
+        Returns one row per day: the day's total training load, Chronic Training
+        Load (CTL, fitness), Acute Training Load (ATL, fatigue), Training Stress
+        Balance (TSB = CTL - ATL, form/freshness) and the Acute:Chronic Workload
+        Ratio (ACWR). Use this to assess whether the athlete is building fitness,
+        peaking, or accumulating too much fatigue.
+
+        These numbers are computed here, not read from Garmin. They are
+        exponentially weighted moving averages of each activity's
+        activityTrainingLoad, with a 42-day time constant for CTL and 7 days for
+        ATL. Garmin's own training-status model is deliberately not consulted,
+        so the series means the same thing on every account -- but it will not
+        match the CTL/ATL shown in Garmin Connect for accounts where Garmin
+        does publish them.
+
+        Rest days count as zero load rather than being skipped, so a gap in
+        training shows up as decay. Days are the athlete's local calendar days.
+
+        Rows carry "ramp_in": true while less than 42 days of history precede
+        them. CTL is still filling there, which makes TSB read misleadingly
+        positive. Do not present those values as settled.
+
+        ACWR is omitted on days where CTL is still zero, because the ratio is
+        undefined rather than zero.
 
         Recommended range: 4-8 weeks. Maximum: 90 days.
 
@@ -815,85 +892,64 @@ def register_tools(app):
         if days < 1:
             return "end_date must be on or after start_date."
 
-        trend = []
-        current = start
+        warmup_start = start - datetime.timedelta(days=_PMC_WARMUP_DAYS)
+        try:
+            loads, earliest, activity_count = _daily_training_loads(warmup_start, end)
+        except Exception as e:
+            return json.dumps({
+                "status": "error",
+                "message": f"Error retrieving activities: {str(e)}",
+            }, indent=2)
+
+        # Walk from the start of available history so CTL/ATL arrive at the
+        # requested window already warmed up.
+        history_start = earliest or start
+        atl = 0.0
+        ctl = 0.0
+        rows: List[Dict[str, Any]] = []
+        current = min(history_start, start)
         while current <= end:
-            date_str = current.isoformat()
-            try:
-                data = garmin_client.get_training_status(date_str)
-                if data:
-                    # latestTrainingStatusData is a dict keyed by device ID, not
-                    # the DTO directly. Pick the primary training device when
-                    # available, fall back to the first device. Use `or {}` to
-                    # coalesce explicit nulls (Garmin returns None for sections
-                    # the user has no data in, which breaks chained `.get`).
-                    recent_status = data.get("mostRecentTrainingStatus") or {}
-                    latest_data = recent_status.get("latestTrainingStatusData") or {}
-                    status_data: Dict[str, Any] = {}
-                    for dev_data in latest_data.values():
-                        if not isinstance(dev_data, dict):
-                            continue
-                        if dev_data.get("primaryTrainingDevice"):
-                            status_data = dev_data
-                            break
-                        if not status_data:
-                            status_data = dev_data
-                    atl_dto = status_data.get("acuteTrainingLoadDTO") or {}
-                    most_recent_vo2 = data.get("mostRecentVO2Max") or {}
-                    vo2_data = most_recent_vo2.get("generic") or {}
-                    entry: Dict[str, Any] = {"date": date_str}
-                    atl = atl_dto.get("dailyTrainingLoadAcute")
-                    ctl = atl_dto.get("dailyTrainingLoadChronic")
-                    acwr = atl_dto.get("dailyAcuteChronicWorkloadRatio")
-                    if atl is not None:
-                        entry["atl"] = round(atl, 1)
-                    if ctl is not None:
-                        entry["ctl"] = round(ctl, 1)
-                    if atl is not None and ctl is not None:
-                        entry["tsb"] = round(ctl - atl, 1)
-                    if acwr is not None:
-                        entry["acwr"] = round(acwr, 2)
-                    acwr_status = atl_dto.get("acwrStatus")
-                    if acwr_status:
-                        entry["acwr_status"] = acwr_status
-                    acwr_pct = atl_dto.get("acwrPercent")
-                    if acwr_pct is not None:
-                        entry["acwr_percent"] = acwr_pct
-                    chronic_min = atl_dto.get("minTrainingLoadChronic")
-                    if chronic_min is not None:
-                        entry["optimal_chronic_load_min"] = round(chronic_min, 1)
-                    chronic_max = atl_dto.get("maxTrainingLoadChronic")
-                    if chronic_max is not None:
-                        entry["optimal_chronic_load_max"] = round(chronic_max, 1)
-                    # Device data now has training status fields flattened — no
-                    # longer wrapped in a trainingStatusDTO sub-object.
-                    ts_phrase = status_data.get("trainingStatusFeedbackPhrase")
-                    if ts_phrase:
-                        entry["training_status"] = ts_phrase
-                    ts_code = status_data.get("trainingStatus")
-                    if ts_code is not None:
-                        entry["training_status_code"] = ts_code
-                    fitness_trend = status_data.get("fitnessTrend")
-                    if fitness_trend is not None:
-                        entry["fitness_trend"] = fitness_trend
-                    vo2 = vo2_data.get("vo2MaxValue")
-                    if vo2 is not None:
-                        entry["vo2_max"] = round(vo2, 1)
-                    if len(entry) > 1:  # has more than just date
-                        trend.append(entry)
-            except Exception:
-                pass  # skip days with no data
+            load = loads.get(current, 0.0)
+            atl = _ewma_next(atl, load, _ATL_TAU_DAYS)
+            ctl = _ewma_next(ctl, load, _CTL_TAU_DAYS)
+            if current >= start:
+                row: Dict[str, Any] = {
+                    "date": current.isoformat(),
+                    "load": round(load, 1),
+                    "atl": round(atl, 1),
+                    "ctl": round(ctl, 1),
+                    "tsb": round(ctl - atl, 1),
+                }
+                if ctl > 0:
+                    row["acwr"] = round(atl / ctl, 2)
+                if (current - history_start).days < _PMC_RAMP_IN_DAYS:
+                    row["ramp_in"] = True
+                rows.append(row)
             current += datetime.timedelta(days=1)
 
-        if not trend:
-            return f"No training load data found between {start_date} and {end_date}."
-
-        return json.dumps({
+        result: Dict[str, Any] = {
             "start_date": start_date,
             "end_date": end_date,
-            "days_with_data": len(trend),
-            "trend": trend,
-        }, indent=2)
+            "source": "computed_locally",
+            "model": {
+                "ctl_time_constant_days": _CTL_TAU_DAYS,
+                "atl_time_constant_days": _ATL_TAU_DAYS,
+                "warmup_days_fetched": _PMC_WARMUP_DAYS,
+                "load_field": "activityTrainingLoad",
+            },
+            "days": len(rows),
+            "days_with_load": sum(1 for d in rows if d["load"] > 0),
+        }
+        if earliest is not None:
+            result["history_starts"] = earliest.isoformat()
+        if activity_count == 0:
+            result["status"] = "no_activities_in_range"
+            result["message"] = (
+                f"No activities between {warmup_start.isoformat()} and {end_date}, "
+                "so every day carries zero load and the chart is flat at zero."
+            )
+        result["trend"] = rows
+        return json.dumps(result, indent=2)
 
     @app.tool()
     async def get_training_load_balance(date: str) -> str:
