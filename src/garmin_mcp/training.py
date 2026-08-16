@@ -969,10 +969,22 @@ def register_tools(app):
         try:
             data = garmin_client.get_training_status(date)
         except Exception as e:
-            return f"Error retrieving training load balance: {str(e)}"
+            return json.dumps({
+                "status": "error",
+                "date": date,
+                "message": f"Error retrieving training load balance: {str(e)}",
+            }, indent=2)
 
         if not data:
-            return f"No training load balance data found for {date}."
+            return json.dumps({
+                "status": "api_returned_no_data",
+                "date": date,
+                "message": (
+                    "Garmin's training-status endpoint returned an empty "
+                    f"response for {date}. This is a transport-level empty, "
+                    "not a statement about the device."
+                ),
+            }, indent=2)
 
         # Same `or {}` pattern as the rest of this module: Garmin returns
         # explicit None for sections the user has no data in, which breaks
@@ -993,7 +1005,20 @@ def register_tools(app):
                 load_data = dev_data
 
         if not load_data:
-            return f"No training load balance data found for {date}."
+            return json.dumps({
+                "status": "not_available_for_this_account",
+                "date": date,
+                "message": (
+                    "Garmin answered but published no Load Focus for any "
+                    "device. Load Focus comes from Garmin's training-status "
+                    "model, which only populates for accounts and devices "
+                    "that record qualifying activities. Retrying, or trying "
+                    "another date, will not change this. Per-activity "
+                    "aerobic/anaerobic training effect is still available "
+                    "from get_training_effect, and get_training_load_trend "
+                    "computes CTL/ATL locally."
+                ),
+            }, indent=2)
 
         def _band(load_key: str, min_key: str, max_key: str) -> Optional[Dict[str, Any]]:
             load = load_data.get(load_key)
