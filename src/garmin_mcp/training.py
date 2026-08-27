@@ -1282,6 +1282,67 @@ def register_tools(app):
         }, indent=2)
 
     @app.tool()
+    async def get_readiness_trend(start_date: str, end_date: str) -> str:
+        """Get the locally computed readiness score for each day in a range.
+
+        Same heuristic as get_readiness (same weights, same component
+        definitions); see that tool for what the score is and is not. Rows
+        are compact: date, readiness, band, and the four component scores.
+        A component key is absent on days where its data is missing; the
+        remaining weights are renormalized for that day. Use get_readiness
+        for one day's raw inputs and reason.
+
+        Each data source is fetched once for the whole range, but HRV still
+        needs one request per night including the 60-night baseline before
+        start_date, so long ranges take a while.
+
+        Maximum: 60 days.
+
+        Args:
+            start_date: Start date in YYYY-MM-DD format
+            end_date: End date in YYYY-MM-DD format
+        """
+        MAX_DAYS = 60
+        try:
+            start = datetime.date.fromisoformat(start_date)
+            end = datetime.date.fromisoformat(end_date)
+        except ValueError as e:
+            return f"Invalid date format: {e}. Use YYYY-MM-DD."
+
+        days = (end - start).days + 1
+        if days > MAX_DAYS:
+            return f"Date range too large ({days} days). Maximum is {MAX_DAYS} days."
+        if days < 1:
+            return "end_date must be on or after start_date."
+
+        sources = _fetch_readiness_sources(start, end)
+
+        trend: List[Dict[str, Any]] = []
+        current = start
+        while current <= end:
+            components, _missing = _readiness_components(current, sources)
+            if components:
+                readiness, band = _aggregate_readiness(components)
+                row: Dict[str, Any] = {
+                    "date": current.isoformat(),
+                    "readiness": readiness,
+                    "band": band,
+                }
+                for name in _READINESS_WEIGHTS:
+                    if name in components:
+                        row[name] = components[name]["score"]
+                trend.append(row)
+            current += datetime.timedelta(days=1)
+
+        return json.dumps({
+            "start_date": start_date,
+            "end_date": end_date,
+            "days": days,
+            "days_scored": len(trend),
+            "trend": trend,
+        }, indent=2)
+
+    @app.tool()
     async def get_training_load_balance(date: str) -> str:
         """Get Garmin's Load Focus — the distribution of the trailing-month
         training load across Aerobic Low, Aerobic High, and Anaerobic intensity
