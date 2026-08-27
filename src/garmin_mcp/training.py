@@ -176,6 +176,168 @@ def _resting_heart_rate(date_str: str) -> Optional[float]:
     return None
 
 
+def _garmin_sleep_score(date_str: str) -> Optional[float]:
+    """Fetch Garmin's overall sleep score; None when absent or unfetchable."""
+    try:
+        daily_sleep = _as_dict(
+            _as_dict(garmin_client.get_sleep_data(date_str)).get("dailySleepDTO")
+        )
+    except Exception:
+        return None
+    value = _as_dict(
+        _as_dict(daily_sleep.get("sleepScores")).get("overall")
+    ).get("value")
+    return float(value) if _is_number(value) else None
+
+
+def _fetch_readiness_sources(
+    start: datetime.date, end: datetime.date
+) -> Dict[str, Any]:
+    """Fetch every readiness input once for [start, end].
+
+    HRV and resting HR are fetched further back than `start` because every
+    scored day needs its own trailing baseline window. Values are keyed by
+    date so a day's baseline is a pure lookup.
+    """
+    hrv_by_date: Dict[datetime.date, float] = {}
+    day = start - datetime.timedelta(days=_READINESS_HRV_BASELINE_DAYS)
+    while day <= end:
+        value = _last_night_hrv(day.isoformat())
+        if value is not None:
+            hrv_by_date[day] = value
+        day += datetime.timedelta(days=1)
+
+    sleep_by_date: Dict[datetime.date, float] = {}
+    day = start
+    while day <= end:
+        value = _garmin_sleep_score(day.isoformat())
+        if value is not None:
+            sleep_by_date[day] = value
+        day += datetime.timedelta(days=1)
+
+    rhr_by_date: Dict[datetime.date, float] = {}
+    day = start - datetime.timedelta(days=_READINESS_RHR_BASELINE_DAYS)
+    while day <= end:
+        value = _resting_heart_rate(day.isoformat())
+        if value is not None:
+            rhr_by_date[day] = value
+        day += datetime.timedelta(days=1)
+
+    try:
+        rows, _earliest, activity_count = _compute_pmc_rows(start, end)
+    except Exception:
+        rows, activity_count = [], 0
+    pmc_by_date = {
+        datetime.date.fromisoformat(row["date"]): row for row in rows
+    }
+
+    return {
+        "hrv": hrv_by_date,
+        "sleep": sleep_by_date,
+        "rhr": rhr_by_date,
+        "pmc": pmc_by_date,
+        "activity_count": activity_count,
+    }
+
+
+def _readiness_components(
+    day: datetime.date, sources: Dict[str, Any]
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Score one day's readiness components from prefetched sources.
+
+    Returns the available components (with their raw inputs) and the names
+    of the components whose data is missing for that day.
+    """
+    components: Dict[str, Dict[str, Any]] = {}
+    missing: List[str] = []
+
+    hrv_by_date = sources["hrv"]
+    last_night = hrv_by_date.get(day)
+    baseline_nights = [
+        hrv_by_date[night]
+        for offset in range(1, _READINESS_HRV_BASELINE_DAYS + 1)
+        for night in (day - datetime.timedelta(days=offset),)
+        if night in hrv_by_date
+    ]
+    baseline = (
+        sum(baseline_nights) / len(baseline_nights) if baseline_nights else 0.0
+    )
+    if last_night is not None and baseline > 0:
+        ratio = last_night / baseline
+        components["hrv"] = {
+            "score": round(_linear_score(ratio, 0.70, 1.00), 1),
+            "weight": _READINESS_WEIGHTS["hrv"],
+            "last_night_ms": round(last_night, 1),
+            "baseline_ms": round(baseline, 1),
+            "baseline_nights": len(baseline_nights),
+            "ratio": round(ratio, 3),
+        }
+    else:
+        missing.append("hrv")
+
+    sleep_score = sources["sleep"].get(day)
+    if sleep_score is not None:
+        components["sleep"] = {
+            "score": round(min(max(sleep_score, 0.0), 100.0), 1),
+            "weight": _READINESS_WEIGHTS["sleep"],
+            "garmin_sleep_score": round(sleep_score, 1),
+        }
+    else:
+        missing.append("sleep")
+
+    rhr_by_date = sources["rhr"]
+    today_rhr = rhr_by_date.get(day)
+    previous_rhr = [
+        rhr_by_date[past]
+        for offset in range(1, _READINESS_RHR_BASELINE_DAYS + 1)
+        for past in (day - datetime.timedelta(days=offset),)
+        if past in rhr_by_date
+    ]
+    if today_rhr is not None and previous_rhr:
+        median = statistics.median(previous_rhr)
+        elevation = max(0.0, today_rhr - median)
+        components["rhr"] = {
+            "score": round(min(max(100.0 - 10.0 * elevation, 0.0), 100.0), 1),
+            "weight": _READINESS_WEIGHTS["rhr"],
+            "today_bpm": round(today_rhr, 1),
+            "7d_median_bpm": round(median, 1),
+            "elevation": round(elevation, 1),
+        }
+    else:
+        missing.append("rhr")
+
+    row = sources["pmc"].get(day) if sources["activity_count"] > 0 else None
+    if row is not None:
+        components["tsb"] = {
+            "score": round(_linear_score(row["tsb"], -60.0, 0.0), 1),
+            "weight": _READINESS_WEIGHTS["tsb"],
+            "tsb": row["tsb"],
+            "ctl": row["ctl"],
+            "atl": row["atl"],
+        }
+    else:
+        missing.append("tsb")
+
+    return components, missing
+
+
+def _aggregate_readiness(components: Dict[str, Dict[str, Any]]) -> Tuple[int, str]:
+    """Renormalize weights over the available components and band the total."""
+    total_weight = sum(c["weight"] for c in components.values())
+    readiness = round(
+        sum(c["weight"] * c["score"] for c in components.values()) / total_weight
+    )
+    if readiness >= 80:
+        band = "prime"
+    elif readiness >= 60:
+        band = "ready"
+    elif readiness >= 40:
+        band = "compromised"
+    else:
+        band = "rest"
+    return readiness, band
+
+
 def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
     """Find all VO2 max values by sport in known Garmin response shapes."""
     if isinstance(data, list):
@@ -1060,95 +1222,8 @@ def register_tools(app):
         except ValueError as e:
             return f"Invalid date format: {e}. Use YYYY-MM-DD."
 
-        components: Dict[str, Dict[str, Any]] = {}
-        missing: List[str] = []
-
-        # --- hrv: last night vs the 60-night personal baseline ---
-        last_night = _last_night_hrv(date)
-        baseline_nights: List[float] = []
-        if last_night is not None:
-            for offset in range(1, _READINESS_HRV_BASELINE_DAYS + 1):
-                night = (day - datetime.timedelta(days=offset)).isoformat()
-                value = _last_night_hrv(night)
-                if value is not None:
-                    baseline_nights.append(value)
-        baseline = (
-            sum(baseline_nights) / len(baseline_nights) if baseline_nights else 0.0
-        )
-        if last_night is not None and baseline > 0:
-            ratio = last_night / baseline
-            components["hrv"] = {
-                "score": round(_linear_score(ratio, 0.70, 1.00), 1),
-                "weight": _READINESS_WEIGHTS["hrv"],
-                "last_night_ms": round(last_night, 1),
-                "baseline_ms": round(baseline, 1),
-                "baseline_nights": len(baseline_nights),
-                "ratio": round(ratio, 3),
-            }
-        else:
-            missing.append("hrv")
-
-        # --- sleep: Garmin's own score for the night ending on `date` ---
-        sleep_score = None
-        try:
-            daily_sleep = _as_dict(
-                _as_dict(garmin_client.get_sleep_data(date)).get("dailySleepDTO")
-            )
-            value = _as_dict(
-                _as_dict(daily_sleep.get("sleepScores")).get("overall")
-            ).get("value")
-            if _is_number(value):
-                sleep_score = float(value)
-        except Exception:
-            sleep_score = None
-        if sleep_score is not None:
-            components["sleep"] = {
-                "score": round(min(max(sleep_score, 0.0), 100.0), 1),
-                "weight": _READINESS_WEIGHTS["sleep"],
-                "garmin_sleep_score": round(sleep_score, 1),
-            }
-        else:
-            missing.append("sleep")
-
-        # --- rhr: elevation above the previous 7 days' median ---
-        today_rhr = _resting_heart_rate(date)
-        previous_rhr: List[float] = []
-        if today_rhr is not None:
-            for offset in range(1, _READINESS_RHR_BASELINE_DAYS + 1):
-                value = _resting_heart_rate(
-                    (day - datetime.timedelta(days=offset)).isoformat()
-                )
-                if value is not None:
-                    previous_rhr.append(value)
-        if today_rhr is not None and previous_rhr:
-            median = statistics.median(previous_rhr)
-            elevation = max(0.0, today_rhr - median)
-            components["rhr"] = {
-                "score": round(min(max(100.0 - 10.0 * elevation, 0.0), 100.0), 1),
-                "weight": _READINESS_WEIGHTS["rhr"],
-                "today_bpm": round(today_rhr, 1),
-                "7d_median_bpm": round(median, 1),
-                "elevation": round(elevation, 1),
-            }
-        else:
-            missing.append("rhr")
-
-        # --- tsb: freshness from the locally computed PMC ---
-        try:
-            rows, _earliest, activity_count = _compute_pmc_rows(day, day)
-        except Exception:
-            rows, activity_count = [], 0
-        if rows and activity_count > 0:
-            row = rows[-1]
-            components["tsb"] = {
-                "score": round(_linear_score(row["tsb"], -60.0, 0.0), 1),
-                "weight": _READINESS_WEIGHTS["tsb"],
-                "tsb": row["tsb"],
-                "ctl": row["ctl"],
-                "atl": row["atl"],
-            }
-        else:
-            missing.append("tsb")
+        sources = _fetch_readiness_sources(day, day)
+        components, missing = _readiness_components(day, sources)
 
         # --- informational: Garmin's remaining recovery timer ---
         recovery_hours = None
@@ -1173,18 +1248,7 @@ def register_tools(app):
                 ),
             }, indent=2)
 
-        total_weight = sum(c["weight"] for c in components.values())
-        readiness = round(
-            sum(c["weight"] * c["score"] for c in components.values()) / total_weight
-        )
-        if readiness >= 80:
-            band = "prime"
-        elif readiness >= 60:
-            band = "ready"
-        elif readiness >= 40:
-            band = "compromised"
-        else:
-            band = "rest"
+        readiness, band = _aggregate_readiness(components)
 
         # The component pulling the weighted total down the hardest, not
         # merely the lowest raw subscore.
