@@ -21,6 +21,7 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 - Weekly health aggregates (steps, stress, intensity minutes)
 - Advanced cycling analytics: power zones, FIT file analysis, DI2 electronic shift intelligence
 - Training load trend (CTL/ATL/TSB), HRV trend, VO2 max trend, respiration rate trend
+- Locally computed readiness score (HRV vs baseline, sleep, resting HR, TSB) with fixed, visible weights
 - Power Duration Curve, climb detection with VAM, cardiac drift (aerobic decoupling), W/kg calculations
 
 ### Tool Coverage
@@ -29,7 +30,7 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 
 - ✅ Activity Management (20 tools) - includes write tools for type, description, event type, perceived effort, and feel
 - ✅ Health & Wellness (31 tools) - includes custom lightweight summary tools
-- ✅ Training & Performance (13 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends
+- ✅ Training & Performance (16 tools) - includes CTL/ATL/TSB, HRV, VO2 max, and respiration trends, plus a locally computed readiness score (`get_readiness`)
 - ✅ Workouts (8 tools)
 - ✅ Devices (7 tools)
 - ✅ Gear Management (5 tools)
