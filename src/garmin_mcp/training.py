@@ -84,6 +84,46 @@ def _daily_training_loads(
     return loads, earliest, counted
 
 
+def _compute_pmc_rows(
+    start: datetime.date, end: datetime.date
+) -> Tuple[List[Dict[str, Any]], Optional[datetime.date], int]:
+    """Compute the PMC (CTL/ATL/TSB) day by day over the requested window.
+
+    Fetches _PMC_WARMUP_DAYS of activities before `start` and walks the EWMAs
+    from the earliest activity seen, so CTL/ATL arrive at the window already
+    warmed up. Returns one row per day in [start, end] plus the earliest
+    activity date and the activity count from _daily_training_loads.
+    """
+    warmup_start = start - datetime.timedelta(days=_PMC_WARMUP_DAYS)
+    loads, earliest, activity_count = _daily_training_loads(warmup_start, end)
+
+    history_start = earliest or start
+    atl = 0.0
+    ctl = 0.0
+    rows: List[Dict[str, Any]] = []
+    current = min(history_start, start)
+    while current <= end:
+        load = loads.get(current, 0.0)
+        atl = _ewma_next(atl, load, _ATL_TAU_DAYS)
+        ctl = _ewma_next(ctl, load, _CTL_TAU_DAYS)
+        if current >= start:
+            row: Dict[str, Any] = {
+                "date": current.isoformat(),
+                "load": round(load, 1),
+                "atl": round(atl, 1),
+                "ctl": round(ctl, 1),
+                "tsb": round(ctl - atl, 1),
+            }
+            if ctl > 0:
+                row["acwr"] = round(atl / ctl, 2)
+            if (current - history_start).days < _PMC_RAMP_IN_DAYS:
+                row["ramp_in"] = True
+            rows.append(row)
+        current += datetime.timedelta(days=1)
+
+    return rows, earliest, activity_count
+
+
 def _extract_vo2_measurements(data: Any) -> Dict[str, float]:
     """Find all VO2 max values by sport in known Garmin response shapes."""
     if isinstance(data, list):
@@ -892,40 +932,13 @@ def register_tools(app):
         if days < 1:
             return "end_date must be on or after start_date."
 
-        warmup_start = start - datetime.timedelta(days=_PMC_WARMUP_DAYS)
         try:
-            loads, earliest, activity_count = _daily_training_loads(warmup_start, end)
+            rows, earliest, activity_count = _compute_pmc_rows(start, end)
         except Exception as e:
             return json.dumps({
                 "status": "error",
                 "message": f"Error retrieving activities: {str(e)}",
             }, indent=2)
-
-        # Walk from the start of available history so CTL/ATL arrive at the
-        # requested window already warmed up.
-        history_start = earliest or start
-        atl = 0.0
-        ctl = 0.0
-        rows: List[Dict[str, Any]] = []
-        current = min(history_start, start)
-        while current <= end:
-            load = loads.get(current, 0.0)
-            atl = _ewma_next(atl, load, _ATL_TAU_DAYS)
-            ctl = _ewma_next(ctl, load, _CTL_TAU_DAYS)
-            if current >= start:
-                row: Dict[str, Any] = {
-                    "date": current.isoformat(),
-                    "load": round(load, 1),
-                    "atl": round(atl, 1),
-                    "ctl": round(ctl, 1),
-                    "tsb": round(ctl - atl, 1),
-                }
-                if ctl > 0:
-                    row["acwr"] = round(atl / ctl, 2)
-                if (current - history_start).days < _PMC_RAMP_IN_DAYS:
-                    row["ramp_in"] = True
-                rows.append(row)
-            current += datetime.timedelta(days=1)
 
         result: Dict[str, Any] = {
             "start_date": start_date,
@@ -943,9 +956,10 @@ def register_tools(app):
         if earliest is not None:
             result["history_starts"] = earliest.isoformat()
         if activity_count == 0:
+            fetch_start = start - datetime.timedelta(days=_PMC_WARMUP_DAYS)
             result["status"] = "no_activities_in_range"
             result["message"] = (
-                f"No activities between {warmup_start.isoformat()} and {end_date}, "
+                f"No activities between {fetch_start.isoformat()} and {end_date}, "
                 "so every day carries zero load and the chart is flat at zero."
             )
         result["trend"] = rows
