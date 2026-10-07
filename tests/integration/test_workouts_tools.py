@@ -224,6 +224,49 @@ async def test_get_workout_by_id_tool_ignores_malformed_target_blocks(
 
 
 @pytest.mark.asyncio
+async def test_get_workout_by_id_tool_keeps_reps_plus(
+    app_with_workouts, mock_garmin_client
+):
+    """Reps+ (isMinReps) survives curation; plain rep targets carry no flag."""
+    import json as json_module
+
+    def rep_step(order, reps, **extra):
+        return {
+            "type": "ExecutableStepDTO",
+            "stepOrder": order,
+            "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+            "endCondition": {"conditionTypeId": 10, "conditionTypeKey": "reps"},
+            "endConditionValue": reps,
+            "category": "ROW",
+            "exerciseName": "SEATED_CABLE_ROW",
+            **extra,
+        }
+
+    mock_garmin_client.get_workout_by_id.return_value = {
+        "workoutId": 123458,
+        "workoutName": "Reps plus",
+        "sportType": {"sportTypeId": 5, "sportTypeKey": "strength_training"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 5, "sportTypeKey": "strength_training"},
+            "workoutSteps": [
+                rep_step(1, 8.0, isMinReps=True),
+                rep_step(2, 10.0),
+            ],
+        }],
+    }
+
+    result = await app_with_workouts.call_tool(
+        "get_workout_by_id", {"workout_id": 123458}
+    )
+
+    steps = json_module.loads(result[0][0].text)["segments"][0]["steps"]
+    assert steps[0]["end_condition_value"] == 8.0
+    assert steps[0]["is_min_reps"] is True
+    assert "is_min_reps" not in steps[1]
+
+
+@pytest.mark.asyncio
 async def test_get_workout_by_uuid_tool(app_with_workouts, mock_garmin_client):
     """Test get_workout_by_id tool with UUID (training plan workout)"""
     import json as json_module

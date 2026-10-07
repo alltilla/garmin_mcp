@@ -408,6 +408,9 @@ def _curate_workout_step(step: dict) -> dict:
     if step.get('endConditionValue'):
         # Value meaning depends on condition type (seconds for time, meters for distance)
         curated['end_condition_value'] = step.get('endConditionValue')
+    # Reps+ ("8+"): the rep target is a minimum, not an exact count
+    if step.get('isMinReps'):
+        curated['is_min_reps'] = True
 
     # Primary target (heart rate, pace, power, etc.)
     _curate_step_target(
